@@ -23,18 +23,24 @@ for key in $keys; do
 
     echo "🔍 Processing $repo_name"
 
-    if [ ! -d "$repo_dir" ]; then
-        git clone --quiet "$GIT_BASE_SSH:$repo_name.git" "$repo_dir" || {
-            echo "⚠️ Failed to clone $repo_name"
-            continue
-        }
+    if [ -d "$repo_dir/.git" ]; then
+    echo "📁 Repo already exists. Fetching latest changes..."
+    cd "$repo_dir" || continue
+    git fetch --all --tags --quiet
+    else
+    echo "⬇️ Cloning $repo_name..."
+    git clone --quiet "$GIT_BASE_SSH:$repo_name.git" "$repo_dir" || {
+        echo "⚠️ Failed to clone $repo_name"
+        continue
+    }
+    cd "$repo_dir" || continue
     fi
 
     cd "$repo_dir" || continue
     git fetch --all --tags --quiet
 
     # Get latest semver tag (must match release format X.Y.Z)
-    latest_tag=$(git tag --sort=-creatordate | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | tail -n 1)
+    latest_tag=$(git tag | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
 
     if [ -z "$latest_tag" ]; then
         echo "⚠️ No release tags found — skipping"
