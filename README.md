@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# vm_connect.sh — Looping SSH wrapper for Git Bash using creds in ~/.ssh/creds_enc.
-#                Connect to any number of VMs in one run.
+# vm_connect.sh — Git Bash wrapper using creds in ~/.ssh/creds_enc + plink.exe
 #
-# Usage: ./vm_connect.sh
-# Requires: sshpass, openssl, ssh (all available in your PATH)
+# Requirements:
+#   • Git for Windows (ssh, openssl available)
+#   • plink.exe (PuTTY) somewhere in your PATH
 
 set -euo pipefail
 
 CREDS_FILE="${HOME}/.ssh/creds_enc"
 
-# — Step 1: create creds_enc if missing —
+# — 1) Create creds_enc if missing —
 if [ ! -f "$CREDS_FILE" ]; then
   read -p "No credentials file at $CREDS_FILE. Create it now? (y/n) " yn
   case "$yn" in
@@ -21,7 +21,6 @@ if [ ! -f "$CREDS_FILE" ]; then
 
       mkdir -p "${HOME}/.ssh"
       chmod 700 "${HOME}/.ssh"
-      # encrypt one-line "user:pass"
       openssl enc -aes-256-cbc -salt \
         -pass pass:"$ENC_PASS" \
         -out "$CREDS_FILE" <<EOF
@@ -37,7 +36,7 @@ EOF
   esac
 fi
 
-# — Step 2: decrypt creds once —
+# — 2) Decrypt once —
 read -s -p "Passphrase to unlock $CREDS_FILE: " FILE_PASS; echo
 CREDS=$(openssl enc -aes-256-cbc -d \
          -in "$CREDS_FILE" \
@@ -47,13 +46,13 @@ CREDS=$(openssl enc -aes-256-cbc -d \
 USER=${CREDS%%:*}
 PASSWORD=${CREDS#*:}
 
-# — Step 3: ensure sshpass is available —
-if ! command -v sshpass >/dev/null; then
-  echo "ERROR: sshpass not found in PATH. Please install sshpass for Git Bash." >&2
+# — 3) Ensure plink.exe is in PATH —
+if ! command -v plink.exe &>/dev/null; then
+  echo "ERROR: plink.exe not found in PATH. Download PuTTY's plink.exe and add it to PATH." >&2
   exit 3
 fi
 
-# — Step 4: loop for multiple hosts —
+# — 4) Loop for multiple connections —
 while true; do
   read -p $'\nEnter host (or type "quit" to exit): ' HOST
   [[ "$HOST" == "quit" ]] && { echo "Goodbye."; break; }
@@ -63,17 +62,15 @@ while true; do
   echo "Connecting to $HOST..."
 
   if [ -n "$INIT_CMD" ]; then
-    # run initial, then exec an interactive shell
-    sshpass -p "$PASSWORD" ssh -t \
-      -o PubkeyAuthentication=no \
-      -o StrictHostKeyChecking=ask \
+    # Run init command, then drop you into an interactive bash shell
+    plink.exe -ssh -pw "$PASSWORD" -t \
+      -o "StrictHostKeyChecking=ask" \
       "$USER@$HOST" \
-      "$INIT_CMD; exec \$SHELL -l"
+      "$INIT_CMD; exec bash --login"
   else
-    # pure interactive login
-    sshpass -p "$PASSWORD" ssh -t \
-      -o PubkeyAuthentication=no \
-      -o StrictHostKeyChecking=ask \
+    # Pure interactive login
+    plink.exe -ssh -pw "$PASSWORD" -t \
+      -o "StrictHostKeyChecking=ask" \
       "$USER@$HOST"
   fi
 
