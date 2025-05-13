@@ -1,80 +1,110 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# vm_connect.sh — SSH into a VM using creds in ~/.ssh/creds_enc,
+#                run a one-off initial command, then give you an interactive
+#                REPL.  Type `exit` at its prompt to drop out of the VM
+#                without having to re-enter your decryption passphrase.
+#
+# Usage: ./vm_connect.sh <host> "<initial-command>"
+# Requires: openssl, expect, ssh
 
-INPUT_FILE="repos.yml"
-OUTPUT_FILE="updated_repos.yml"
-TEMP_DIR="./repos_temp"
-USER_X="userX"
-GIT_BASE_SSH="git@gitstash.com"
+set -euo pipefail
 
-mkdir -p "$TEMP_DIR"
-cp "$INPUT_FILE" "$OUTPUT_FILE"
+CREDS_FILE="${HOME}/.ssh/creds_enc"
 
-# Check for yq
-if ! command -v yq &> /dev/null; then
-    echo "❌ 'yq' not found. Install from https://github.com/mikefarah/yq"
-    exit 1
+# 1) If creds file missing, offer to create it
+if [ ! -f "$CREDS_FILE" ]; then
+  read -p "No creds file at $CREDS_FILE. Create it now? (y/n) " yn
+  case "$yn" in
+    [Yy]*)
+      read -p "SSH username: " NEW_USER
+      read -s -p "SSH password: " NEW_PASS; echo
+      read -s -p "Passphrase to encrypt creds: " ENC_PASS; echo
+
+      mkdir -p "${HOME}/.ssh" && chmod 700 "${HOME}/.ssh"
+      # one-liner "user:pass" → encrypted file
+      openssl enc -aes-256-cbc -salt \
+        -pass pass:"$ENC_PASS" \
+        -out "$CREDS_FILE" <<EOF
+$NEW_USER:$NEW_PASS
+EOF
+      chmod 600 "$CREDS_FILE"
+      echo "→ Created $CREDS_FILE"
+      ;;
+    *)
+      echo "Aborted; creds file is required." >&2
+      exit 1
+      ;;
+  esac
 fi
 
-keys=$(yq e 'keys | .[]' "$INPUT_FILE")
+# 2) Parse args
+if [ $# -lt 1 ]; then
+  echo "Usage: $0 <host> [\"<initial-command>\"]"
+  exit 1
+fi
+HOST=$1
+INIT_CMD=${2-}
 
-for key in $keys; do
-    repo_name=$(echo "$key" | sed -E 's/_version$//' | tr '_' '-')
-    repo_dir="$TEMP_DIR/$repo_name"
+# 3) Decrypt creds once
+read -s -p "Passphrase to unlock $CREDS_FILE: " FILE_PASS; echo
+CREDS=$(openssl enc -aes-256-cbc -d -in "$CREDS_FILE" -pass pass:"$FILE_PASS") \
+  || { echo "ERROR: bad passphrase"; exit 2; }
 
-    echo "🔍 Processing $repo_name"
+USER=${CREDS%%:*}
+PASSWORD=${CREDS#*:}
 
-    if [ -d "$repo_dir/.git" ]; then
-    echo "📁 Repo already exists. Fetching latest changes..."
-    cd "$repo_dir" || continue
-    git fetch --all --tags --quiet
-    else
-    echo "⬇️ Cloning $repo_name..."
-    git clone --quiet "$GIT_BASE_SSH:$repo_name.git" "$repo_dir" || {
-        echo "⚠️ Failed to clone $repo_name"
-        continue
+export HOST USER PASSWORD INIT_CMD
+
+# 4) Hand off to Expect
+/usr/bin/env expect <<'EOF'
+  log_user 1
+  set timeout -1
+
+  # grab from env
+  set host     $env(HOST)
+  set user     $env(USER)
+  set password $env(PASSWORD)
+  set init_cmd $env(INIT_CMD)
+
+  # SSH in (password only; ask to add new hosts)
+  spawn ssh \
+    -o PubkeyAuthentication=no \
+    -o StrictHostKeyChecking=ask \
+    $user@$host
+
+  expect {
+    "(yes/no)?" {
+      send "yes\r"; exp_continue
     }
-    cd "$repo_dir" || continue
-    fi
+    "*?assword:*" {
+      send "$password\r"
+    }
+  }
 
-    cd "$repo_dir" || continue
-    git fetch --all --tags --quiet
+  # wait for shell prompt
+  expect -re {[$#] $}
 
-    # Get latest semver tag (must match release format X.Y.Z)
-    latest_tag=$(git tag | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+  # if they passed an initial command, run it
+  if {$init_cmd != ""} {
+    send -- "$init_cmd\r"
+    expect -re {[$#] $}
+  }
 
-    if [ -z "$latest_tag" ]; then
-        echo "⚠️ No release tags found — skipping"
-        cd - > /dev/null
-        continue
-    fi
+  # now a little REPL
+  while {1} {
+    send_user "remote> "
+    expect_user -re "(.*)\n"
+    set cmd \$expect_out(1,string)
+    if {\$cmd eq "exit"} {
+      send "exit\r"
+      break
+    }
+    send -- "\$cmd\r"
+    expect -re {[$#] $}
+  }
 
-    echo "🕑 Latest release tag: $latest_tag"
+  # cleanup: wait for SSH to close
+  expect eof
+EOF
 
-    # Check if repo was updated since tag
-    committers=$(git log "$latest_tag"..origin/master --pretty="%an" | sort -u)
-
-    updated_by_other=false
-    while read -r committer; do
-        if [[ "$committer" != "$USER_X" && -n "$committer" ]]; then
-            updated_by_other=true
-            break
-        fi
-    done <<< "$committers"
-
-    if $updated_by_other; then
-        echo "✅ Updated by someone other than $USER_X → snapshot needed"
-        IFS='.' read -r major minor patch <<< "$latest_tag"
-        minor=$((minor + 1))
-        new_version="${major}.${minor}.0-SNAPSHOT"
-    else
-        echo "🛑 No updates by others → using latest release tag"
-        new_version="$latest_tag"
-    fi
-
-    cd - > /dev/null
-
-    # Write result, preserving order and formatting
-    yq e ".\"$key\" = \"$new_version\"" -i "$OUTPUT_FILE"
-done
-
-echo "✅ Finished. Output written to $OUTPUT_FILE"
